@@ -335,6 +335,140 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS license_contracts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_code TEXT NOT NULL UNIQUE,
+    licensee_name TEXT NOT NULL,
+    licensee_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended','terminated')),
+    status_reason TEXT NOT NULL DEFAULT '',
+    status_changed_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS license_contract_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id INTEGER NOT NULL REFERENCES license_contracts(id),
+    version_no INTEGER NOT NULL CHECK(version_no > 0),
+    effective_from TEXT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'CNY',
+    change_reason TEXT NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(contract_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS license_obligations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_version_id INTEGER NOT NULL REFERENCES license_contract_versions(id) ON DELETE CASCADE,
+    territory TEXT NOT NULL,
+    product_line TEXT NOT NULL,
+    milestone_code TEXT NOT NULL,
+    threshold_amount REAL NOT NULL CHECK(threshold_amount >= 0),
+    royalty_rate REAL NOT NULL CHECK(royalty_rate > 0),
+    asset_codes_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(contract_version_id, territory, product_line, milestone_code)
+);
+CREATE INDEX IF NOT EXISTS idx_license_obligations_version ON license_obligations(contract_version_id);
+
+CREATE TABLE IF NOT EXISTS license_report_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id INTEGER NOT NULL REFERENCES license_contracts(id),
+    period_label TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','reported','reconciling','locked','void')),
+    payable_status TEXT NOT NULL DEFAULT 'pending' CHECK(payable_status IN ('pending','accrued','confirmed','paid','void')),
+    contract_version_id INTEGER REFERENCES license_contract_versions(id),
+    report_id INTEGER REFERENCES license_reports(id),
+    reported_amount REAL NOT NULL DEFAULT 0,
+    accrued_amount REAL NOT NULL DEFAULT 0,
+    adjustment_amount REAL NOT NULL DEFAULT 0,
+    payable_amount REAL NOT NULL DEFAULT 0,
+    void_reason TEXT NOT NULL DEFAULT '',
+    locked_at TEXT,
+    paid_at TEXT,
+    payment_reference TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(contract_id, period_label)
+);
+CREATE INDEX IF NOT EXISTS idx_license_windows_contract ON license_report_windows(contract_id, status);
+
+CREATE TABLE IF NOT EXISTS license_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES license_report_windows(id),
+    contract_id INTEGER NOT NULL REFERENCES license_contracts(id),
+    report_code TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    submitted_by TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(window_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_license_reports_window ON license_reports(window_id, id);
+
+CREATE TABLE IF NOT EXISTS license_report_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES license_reports(id) ON DELETE CASCADE,
+    territory TEXT NOT NULL,
+    product_line TEXT NOT NULL,
+    milestone_code TEXT NOT NULL,
+    reported_sales REAL NOT NULL CHECK(reported_sales >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, territory, product_line, milestone_code)
+);
+
+CREATE TABLE IF NOT EXISTS license_accruals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES license_report_windows(id),
+    obligation_id INTEGER NOT NULL REFERENCES license_obligations(id),
+    contract_version_id INTEGER NOT NULL REFERENCES license_contract_versions(id),
+    report_id INTEGER NOT NULL REFERENCES license_reports(id),
+    report_line_id INTEGER REFERENCES license_report_lines(id),
+    reported_sales REAL NOT NULL DEFAULT 0,
+    threshold_amount REAL NOT NULL,
+    royalty_rate REAL NOT NULL,
+    accrued_amount REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_license_accruals_window ON license_accruals(window_id, status);
+
+CREATE TABLE IF NOT EXISTS license_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES license_report_windows(id),
+    obligation_id INTEGER REFERENCES license_obligations(id),
+    delta_amount REAL NOT NULL CHECK(delta_amount <> 0),
+    reason TEXT NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_license_adjustments_window ON license_adjustments(window_id);
+
+CREATE TABLE IF NOT EXISTS license_differences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES license_report_windows(id),
+    report_id INTEGER REFERENCES license_reports(id),
+    obligation_id INTEGER REFERENCES license_obligations(id),
+    kind TEXT NOT NULL CHECK(kind IN ('missing_item','unexpected_item')),
+    expected_json TEXT NOT NULL DEFAULT '{}',
+    actual_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','resolved')),
+    resolution_note TEXT NOT NULL DEFAULT '',
+    resolved_by INTEGER REFERENCES users(id),
+    resolved_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_license_differences_window ON license_differences(window_id, state);
 """
 
 PERMISSIONS = [
@@ -353,6 +487,9 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("licenses.read", "查看许可合同与结算", "licenses", "read"),
+    ("licenses.write", "维护许可合同、窗口与报告", "licenses", "write"),
+    ("licenses.settle", "锁定结算周期与登记支付", "licenses", "settle"),
 ]
 
 
@@ -417,6 +554,7 @@ def init_db() -> None:
             ("researcher", "研究人员", "查看档案并申请查阅借阅或登记对外合作披露使用"),
             ("approver", "风险审批人", "复核合规处置、位置解密与载体盘点调整"),
             ("auditor", "审计查看员", "只读查看档案事件和审计记录"),
+            ("transfer_manager", "技术转让经理", "跟踪许可报告义务、核对对方报告并准备结算"),
         )
         for code, name, description in roles:
             connection.execute(
@@ -435,7 +573,8 @@ def init_db() -> None:
             ],
             "researcher": ["dossiers.read", "dossiers.disclose"],
             "approver": ["dossiers.read", "approvals.decide"],
-            "auditor": ["dossiers.read", "audit.read"],
+            "auditor": ["dossiers.read", "audit.read", "licenses.read"],
+            "transfer_manager": ["licenses.read", "licenses.write", "licenses.settle"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
